@@ -3,7 +3,8 @@
 #
 # Mirrors every non-fork repository owned by $GITHUB_ENTITY (user or org), plus
 # forks whose upstream owner is in $FORK_INCLUDE_OWNERS, and stores each mirror
-# as a zip archive in a timestamped backup directory.
+# as a zip archive in a timestamped backup directory, one subdirectory per
+# owner (forks are filed under their upstream owner).
 # Exits non-zero if any repository could not be backed up.
 
 set -euo pipefail
@@ -75,7 +76,7 @@ while :; do
     fi
     PAGE_REPOS=$(jq -r --arg owner "$GITHUB_ENTITY" \
         '.[] | select(.fork == false and (.owner.login | ascii_downcase) == ($owner | ascii_downcase))
-             | "\(.name)\t\(.clone_url)"' <<< "$RESPONSE")
+             | "\(.name)\t\(.clone_url)\t\(.owner.login)"' <<< "$RESPONSE")
     if [ -n "$PAGE_REPOS" ]; then
         REPO_LIST+="$PAGE_REPOS"$'\n'
     fi
@@ -109,7 +110,7 @@ if [ -n "$FORK_INCLUDE_OWNERS" ] && [ -n "$FORK_LIST" ]; then
         PARENT_LC=$(tr '[:upper:]' '[:lower:]' <<< "$PARENT_OWNER")
         if [[ "$INCLUDE_LC" == *" $PARENT_LC "* ]]; then
             echo "[$FORK_NAME] Including fork of $PARENT_OWNER."
-            REPO_LIST+="$FORK_NAME"$'\t'"$FORK_CLONE_URL"$'\n'
+            REPO_LIST+="$FORK_NAME"$'\t'"$FORK_CLONE_URL"$'\t'"$PARENT_OWNER"$'\n'
         fi
     done <<< "$FORK_LIST"
 fi
@@ -131,35 +132,47 @@ WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 echo "Found $REPO_COUNT repositories."
-while IFS=$'\t' read -r REPO_NAME CLONE_URL; do
+while IFS=$'\t' read -r REPO_NAME CLONE_URL OWNER_DIR; do
     [ -n "$REPO_NAME" ] || continue
-    echo "[$REPO_NAME] Processing repository..."
+    REPO_LABEL="$OWNER_DIR/$REPO_NAME"
+    echo "[$REPO_LABEL] Processing repository..."
+
+    # Archives are grouped per owner: own repos under $GITHUB_ENTITY, forks
+    # under their upstream owner. Both names come from the API, so reject
+    # anything that is not a plain GitHub login/repo name before using them
+    # as paths.
+    if [[ ! "$OWNER_DIR" =~ ^[A-Za-z0-9-]+$ || ! "$REPO_NAME" =~ ^[A-Za-z0-9._-]+$ || "$REPO_NAME" == "." || "$REPO_NAME" == ".." ]]; then
+        echo "[$REPO_LABEL] Error: unexpected owner or repository name. Skipping this repository." >&2
+        FAILED+=("$REPO_LABEL")
+        continue
+    fi
 
     REPO_DIR="$REPO_NAME.git"
-    ARCHIVE="$BACKUP_DIR/$REPO_DIR.zip"
+    mkdir -p "$BACKUP_DIR/$OWNER_DIR"
+    ARCHIVE="$BACKUP_DIR/$OWNER_DIR/$REPO_DIR.zip"
 
-    echo "[$REPO_NAME] Cloning as a mirror..."
+    echo "[$REPO_LABEL] Cloning as a mirror..."
     if ! git clone -q --mirror "$CLONE_URL" "$WORK_DIR/$REPO_DIR" < /dev/null; then
-        echo "[$REPO_NAME] Error cloning $REPO_NAME. Skipping this repository." >&2
-        FAILED+=("$REPO_NAME")
+        echo "[$REPO_LABEL] Error cloning $REPO_LABEL. Skipping this repository." >&2
+        FAILED+=("$REPO_LABEL")
         rm -rf "${WORK_DIR:?}/$REPO_DIR"
         continue
     fi
 
     # Never archive credentials.
     if grep -qF -- "$GITHUB_TOKEN" "$WORK_DIR/$REPO_DIR/config"; then
-        echo "[$REPO_NAME] Error: token found in mirror config. Refusing to archive." >&2
-        FAILED+=("$REPO_NAME")
+        echo "[$REPO_LABEL] Error: token found in mirror config. Refusing to archive." >&2
+        FAILED+=("$REPO_LABEL")
         rm -rf "${WORK_DIR:?}/$REPO_DIR"
         continue
     fi
 
-    echo "[$REPO_NAME] Creating backup archive."
+    echo "[$REPO_LABEL] Creating backup archive."
     # Write to a temporary name first so a partial zip is never mistaken for a backup.
     if ! (cd "$WORK_DIR" && zip -q -r "$ARCHIVE.partial" "$REPO_DIR" < /dev/null) || \
        ! mv "$ARCHIVE.partial" "$ARCHIVE"; then
-        echo "[$REPO_NAME] Error creating archive. Skipping this repository." >&2
-        FAILED+=("$REPO_NAME")
+        echo "[$REPO_LABEL] Error creating archive. Skipping this repository." >&2
+        FAILED+=("$REPO_LABEL")
         rm -f "$ARCHIVE.partial"
         rm -rf "${WORK_DIR:?}/$REPO_DIR"
         continue
@@ -167,7 +180,7 @@ while IFS=$'\t' read -r REPO_NAME CLONE_URL; do
 
     # TODO: Push repository to a backup git server
 
-    echo "[$REPO_NAME] Removing mirror directory."
+    echo "[$REPO_LABEL] Removing mirror directory."
     rm -rf "${WORK_DIR:?}/$REPO_DIR"
 done <<< "$REPO_LIST"
 
