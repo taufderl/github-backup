@@ -1,55 +1,181 @@
 #!/bin/bash
 # GitHub Repository Mirroring Backup Script
+#
+# Mirrors every non-fork repository owned by $GITHUB_ENTITY (user or org), plus
+# forks whose upstream owner is in $FORK_INCLUDE_OWNERS, and stores each mirror
+# as a zip archive in a timestamped backup directory.
+# Exits non-zero if any repository could not be backed up.
 
-# Load secrets
-source ./secrets.sh
+set -euo pipefail
 
-# Return error if 'jq' is not installed
-if ! command -v jq &> /dev/null
-then
-    echo "Error: 'jq' is not installed. Please install it to parse the GitHub API response."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load configuration
+ENV_FILE="$SCRIPT_DIR/.env"
+if [ ! -f "$ENV_FILE" ]; then
+    echo "Error: $ENV_FILE not found. Copy .env.sample to .env and fill it in." >&2
     exit 1
 fi
+# shellcheck source=.env.sample
+source "$ENV_FILE"
+
+: "${GITHUB_ENTITY:?GITHUB_ENTITY is not set in .env}"
+: "${GITHUB_TOKEN:?GITHUB_TOKEN is not set in .env}"
+GITHUB_API="${GITHUB_API:-https://api.github.com}"
+BACKUP_ROOT="${BACKUP_ROOT:-$SCRIPT_DIR}"
+
+# Return error if a required tool is not installed
+for TOOL in curl jq git zip base64; do
+    if ! command -v "$TOOL" &> /dev/null; then
+        echo "Error: '$TOOL' is not installed." >&2
+        exit 1
+    fi
+done
+
+# Backups contain private repositories; keep them readable by the owner only.
+umask 077
+
+# Call the GitHub API. The token is fed to curl on stdin as a config file so it
+# never appears in the process list.
+github_api() {
+    printf 'header = "Authorization: Bearer %s"\n' "$GITHUB_TOKEN" | \
+        curl -fsS --retry 3 -K - \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$1"
+}
+
+# Authenticate git through environment-supplied config instead of embedding the
+# token in the clone URL. This keeps it out of the process list and out of the
+# mirror's config file (and therefore out of the zip archives).
+GIT_BASIC_AUTH="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+export GIT_CONFIG_VALUE_0="Authorization: Basic $GIT_BASIC_AUTH"
+# Fail instead of hanging on a credential prompt.
+export GIT_TERMINAL_PROMPT=0
 
 echo "Fetching repository list for entity: $GITHUB_ENTITY"
 
-REPO_LIST=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-    "https://api.github.com/user/repos?per_page=100" | \
-    jq -r '.[] | select(.fork == false) | .name')
+# /user/repos is paginated; keep requesting pages until a short page comes back.
+# It also lists repositories of other owners (collaborations, orgs), so filter
+# by owner and keep the API-provided clone URL rather than building one.
+REPO_LIST=""
+FORK_LIST=""
+PER_PAGE=100
+PAGE=1
+while :; do
+    if ! RESPONSE=$(github_api "$GITHUB_API/user/repos?per_page=$PER_PAGE&page=$PAGE"); then
+        echo "Error: Could not retrieve repository list (page $PAGE). Check GITHUB_TOKEN and network connectivity." >&2
+        exit 1
+    fi
+    if ! PAGE_COUNT=$(jq -er 'if type == "array" then length else error("unexpected API response") end' <<< "$RESPONSE"); then
+        echo "Error: Unexpected API response on page $PAGE." >&2
+        exit 1
+    fi
+    PAGE_REPOS=$(jq -r --arg owner "$GITHUB_ENTITY" \
+        '.[] | select(.fork == false and (.owner.login | ascii_downcase) == ($owner | ascii_downcase))
+             | "\(.name)\t\(.clone_url)"' <<< "$RESPONSE")
+    if [ -n "$PAGE_REPOS" ]; then
+        REPO_LIST+="$PAGE_REPOS"$'\n'
+    fi
+    PAGE_FORKS=$(jq -r --arg owner "$GITHUB_ENTITY" \
+        '.[] | select(.fork == true and (.owner.login | ascii_downcase) == ($owner | ascii_downcase))
+             | "\(.name)\t\(.clone_url)\t\(.url)"' <<< "$RESPONSE")
+    if [ -n "$PAGE_FORKS" ]; then
+        FORK_LIST+="$PAGE_FORKS"$'\n'
+    fi
+    if [ "$PAGE_COUNT" -lt "$PER_PAGE" ]; then
+        break
+    fi
+    PAGE=$((PAGE + 1))
+done
+
+FAILED=()
+
+# Forks are skipped unless their upstream owner is listed in FORK_INCLUDE_OWNERS,
+# since a fork of a large project (e.g. the Linux kernel) can be gigabytes.
+# The repo listing does not include the upstream, so look up each fork's parent.
+FORK_INCLUDE_OWNERS="${FORK_INCLUDE_OWNERS:-}"
+if [ -n "$FORK_INCLUDE_OWNERS" ] && [ -n "$FORK_LIST" ]; then
+    INCLUDE_LC=" $(tr '[:upper:]' '[:lower:]' <<< "$FORK_INCLUDE_OWNERS" | tr -s ' \t,' ' ') "
+    while IFS=$'\t' read -r FORK_NAME FORK_CLONE_URL FORK_API_URL; do
+        [ -n "$FORK_NAME" ] || continue
+        if ! PARENT_OWNER=$(github_api "$FORK_API_URL" | jq -er '.parent.owner.login'); then
+            echo "[$FORK_NAME] Error: could not look up fork parent." >&2
+            FAILED+=("$FORK_NAME")
+            continue
+        fi
+        PARENT_LC=$(tr '[:upper:]' '[:lower:]' <<< "$PARENT_OWNER")
+        if [[ "$INCLUDE_LC" == *" $PARENT_LC "* ]]; then
+            echo "[$FORK_NAME] Including fork of $PARENT_OWNER."
+            REPO_LIST+="$FORK_NAME"$'\t'"$FORK_CLONE_URL"$'\n'
+        fi
+    done <<< "$FORK_LIST"
+fi
 
 if [ -z "$REPO_LIST" ]; then
-    echo "Error: Could not retrieve repository list. Check GITHUB_ENTITY, GITHUB_TOKEN, and network connectivity."
+    echo "Error: No repositories found for '$GITHUB_ENTITY'. Check GITHUB_ENTITY and the token's repository access." >&2
     exit 1
 fi
 
-BACKUP_DIR="$(date +%Y%m%d_%H%M)_backups"
+REPO_COUNT=$(printf '%s' "$REPO_LIST" | grep -c .)
+
+BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d_%H%M)_backups"
 mkdir -p "$BACKUP_DIR"
 echo "Created backup directory: $BACKUP_DIR"
 
-echo "Found $(echo "$REPO_LIST" | wc -w) repositories."
-for REPO_NAME in $REPO_LIST; do
+# Clone into a private scratch directory that is always cleaned up, so an
+# interrupted run cannot leave mirrors behind that break the next run.
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+echo "Found $REPO_COUNT repositories."
+while IFS=$'\t' read -r REPO_NAME CLONE_URL; do
+    [ -n "$REPO_NAME" ] || continue
     echo "[$REPO_NAME] Processing repository..."
 
-    # Construct the full source and destination URLs
-    SOURCE_URL="https://$GITHUB_ENTITY:$GITHUB_TOKEN@github.com/$GITHUB_ENTITY/$REPO_NAME.git"
     REPO_DIR="$REPO_NAME.git"
+    ARCHIVE="$BACKUP_DIR/$REPO_DIR.zip"
 
     echo "[$REPO_NAME] Cloning as a mirror..."
-    git clone -q --mirror "$SOURCE_URL" "$REPO_DIR"
+    if ! git clone -q --mirror "$CLONE_URL" "$WORK_DIR/$REPO_DIR" < /dev/null; then
+        echo "[$REPO_NAME] Error cloning $REPO_NAME. Skipping this repository." >&2
+        FAILED+=("$REPO_NAME")
+        rm -rf "${WORK_DIR:?}/$REPO_DIR"
+        continue
+    fi
 
-    if [ $? -ne 0 ]; then
-        echo "[$REPO_NAME] Error cloning $REPO_NAME. Skipping this repository."
+    # Never archive credentials.
+    if grep -qF -- "$GITHUB_TOKEN" "$WORK_DIR/$REPO_DIR/config"; then
+        echo "[$REPO_NAME] Error: token found in mirror config. Refusing to archive." >&2
+        FAILED+=("$REPO_NAME")
+        rm -rf "${WORK_DIR:?}/$REPO_DIR"
         continue
     fi
 
     echo "[$REPO_NAME] Creating backup archive."
-    zip -q -r "$BACKUP_DIR/$REPO_DIR.zip" "$REPO_DIR"
+    # Write to a temporary name first so a partial zip is never mistaken for a backup.
+    if ! (cd "$WORK_DIR" && zip -q -r "$ARCHIVE.partial" "$REPO_DIR" < /dev/null) || \
+       ! mv "$ARCHIVE.partial" "$ARCHIVE"; then
+        echo "[$REPO_NAME] Error creating archive. Skipping this repository." >&2
+        FAILED+=("$REPO_NAME")
+        rm -f "$ARCHIVE.partial"
+        rm -rf "${WORK_DIR:?}/$REPO_DIR"
+        continue
+    fi
 
     # TODO: Push repository to a backup git server
 
     echo "[$REPO_NAME] Removing mirror directory."
-    rm -rf "$REPO_DIR"
-done
+    rm -rf "${WORK_DIR:?}/$REPO_DIR"
+done <<< "$REPO_LIST"
 
-echo "Successfully completed backup process!"
+if [ "${#FAILED[@]}" -gt 0 ]; then
+    echo "Backup finished with ${#FAILED[@]} failed repositories (of $REPO_COUNT selected):" >&2
+    printf '  - %s\n' "${FAILED[@]}" >&2
+    exit 1
+fi
+
+echo "Successfully backed up all $REPO_COUNT repositories!"
 exit 0
